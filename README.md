@@ -1,4 +1,4 @@
-# system-health-agent (in progress)
+# system-health-agent
 
 A one-shot, strictly read-only collector for **Windows 11 x64** (Python 3.12+,
 ordinary user privileges). It reports what it measured and what it could not
@@ -21,7 +21,7 @@ Also: UTC observation timestamp and schema version.
 **Deliberately omitted:** hostname (identifies the machine/user, not needed for
 a single-machine local report), serial numbers, hardware IDs, account names.
 
-**Not in the collector (or anywhere in the project yet):** database, LLM, GUI,
+**Not in the collector (or anywhere in the project yet):** LLM, GUI,
 scheduler/service, battery, thermals, process monitoring, repairs. Diagnostic
 rules live in `diagnostics.py`, not in the collector.
 
@@ -423,6 +423,89 @@ helpers (no `psutil` needed); its last section feeds real collector output
 meaningful, and the static and runtime no-side-effect checks cover only
 `diagnostics.py`'s own source and the call paths they patch.
 
+## Snapshot repository (`storage.py`)
+
+A small local SQLite store for **validated** snapshots (stdlib `sqlite3` and `json`
+only). It is the first component that writes to disk, and it writes only to the
+database path you give it. It does not collect, diagnose, analyse trends, sync,
+prune or delete anything, and it is not wired into `demo.py`.
+
+```python
+from storage import SnapshotRepository
+repo = SnapshotRepository(r"C:\Users\me\health\snapshots.sqlite3")  # no disk access yet
+repo.initialize()                      # explicit and idempotent; creates the file
+record_id = repo.save_snapshot(snapshot)   # validates first; returns the new id
+records = repo.get_snapshots(limit=100)    # tuple of StoredSnapshot
+```
+
+### Contract
+
+- **Explicit setup.** Importing or constructing does nothing. `save_snapshot()` and
+  `get_snapshots()` never create or initialize a database: before `initialize()` they
+  raise `RepositoryNotInitializedError`. `initialize()` does not create missing
+  directories, refuses an incompatible `snapshots` table or a foreign
+  `PRAGMA user_version`, and never alters existing rows.
+- **Schema.** One table `snapshots(id INTEGER PRIMARY KEY AUTOINCREMENT, observed_at TEXT,
+  schema_version INTEGER, payload_json TEXT, stored_at TEXT)`, all `NOT NULL` with
+  `typeof()` checks, an index on `(observed_at, id)`, and `user_version = 1`.
+  `payload_json` is the whole snapshot as deterministic strict JSON (sorted keys,
+  compact, ASCII-escaped, no NaN/Infinity). No findings or other derived data are stored.
+  `stored_at` is the repository's UTC time (`YYYY-MM-DDTHH:MM:SSZ`), distinct from
+  the snapshot's `observed_at`.
+- **Saving.** The snapshot is validated with `validator.validate_snapshot` first; an
+  invalid one raises `InvalidSnapshotError` (with `.issues`), nothing is repaired,
+  nothing is inserted, and the input is never modified. The insert runs in one
+  `BEGIN IMMEDIATE` transaction that is committed or rolled back. The same snapshot saved
+  twice creates two records (no de-duplication).
+- **Retrieving.** `get_snapshots(limit=100)` returns the **most recent** `limit` records
+  (by `observed_at`, then `id`) **ordered oldest first**; ties on `observed_at` are
+  ordered by insertion `id`. `limit` must be a real `int` (not bool/float) from 1 to
+  `MAX_LIMIT` (1000), otherwise `InvalidQueryError` (a `ValueError`). There is no
+  pagination, so older records are not reachable through this API. Reads use a
+  `query_only` connection and cannot modify the database. Records are frozen
+  `StoredSnapshot(id, observed_at, schema_version, stored_at, snapshot)`; every call
+  returns a fresh private copy of the payload dict.
+- **Corruption.** Each returned row is checked (strict JSON, an object, `observed_at` and
+  `schema_version` agreeing with their columns). A bad row raises `CorruptRecordError`
+  (with `.record_id`; the message never echoes stored content) instead of being skipped.
+  Rows are *not* re-validated on read, so history stays readable if the validator
+  later changes.
+- **Errors.** All derive from `StorageError`: `InvalidSnapshotError`,
+  `RepositoryNotInitializedError`, `StorageDatabaseError` (SQLite failures such as
+  locked, unreadable, not a database, incompatible schema; chained to the original),
+  `CorruptRecordError`, `InvalidQueryError`. Programming errors (wrong argument
+  types to the constructor, a bad clock, `sqlite3.ProgrammingError`, and so on) are
+  not caught.
+
+### Privacy
+
+The database holds hostnames, drive letters and other machine details. Treat it as
+**sensitive local data**: it never leaves the machine through this code, and it must
+not be committed or shared. The project `.gitignore` is expected to exclude common
+SQLite extensions (`*.sqlite`, `*.sqlite3`, `*.db`, and journal files); this code does
+not change it. Verify with `git check-ignore -v <your-database-file>` before
+committing, and keep the database outside the repository if possible.
+
+### Limitations
+
+- Per-operation connections; no connection pooling and no long-lived handles.
+- Concurrency: SQLite locking only. A busy database waits `busy_timeout_s` (default 5 s)
+  and then raises `StorageDatabaseError`; this is not tested under heavy contention.
+- Records stay in the database indefinitely (no pruning or deletion API).
+- A valid snapshot is stored as reported; storage does not make readings true.
+- The database file is not encrypted. Atomicity relies on SQLite's guarantees.
+- Not tested on Windows by the author of this change (see below).
+
+### Running the storage tests
+
+```powershell
+.\.venv\Scripts\python.exe -m pytest tests\test_storage.py   # storage only
+.\.venv\Scripts\python.exe -m pytest                          # everything
+```
+
+Each test uses its own `tmp_path` database. Only the section on collector-produced
+snapshots needs `psutil` (skipped without it).
+
 ## Notes and limitations
 
 - **Partition policy:** `psutil.disk_partitions(all=False)`. Volumes flagged
@@ -450,10 +533,12 @@ meaningful, and the static and runtime no-side-effect checks cover only
 collector.py            collect_system_snapshot() and helpers (no I/O, no printing)
 demo.py                 presentation only: prints the snapshot as JSON to stdout
 validator.py            validate_snapshot(): pure, strict contract validator
+storage.py              SnapshotRepository: local SQLite store for validated snapshots
 diagnostics.py          diagnose_snapshot(): pure, deterministic rules + hardware profile
 tests/test_collector.py pytest suite (mocked psutil/platform)
 tests/test_diagnostics.py
                         engine tests (collector-shaped fixtures; real collector output)
+tests/test_storage.py   repository tests (temp databases, injected failures)
 tests/test_validator.py hermetic validator tests (synthetic snapshots, no psutil)
 tests/test_validator_collector_contract.py
                         real collector output must pass the validator
