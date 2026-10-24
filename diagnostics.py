@@ -76,6 +76,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from fractions import Fraction
 import math
+from types import MappingProxyType
 
 from validator import ValidationIssue, validate_snapshot
 
@@ -111,11 +112,11 @@ REASON_NOT_COLLECTED = "NOT_COLLECTED"
 REASON_ZERO_CAPACITY = "ZERO_CAPACITY"
 REASON_NO_DRIVES = "NO_DRIVES_REPORTED"
 
-_REASON_BY_LEAF_STATUS = {
+_REASON_BY_LEAF_STATUS = MappingProxyType({      # read-only: no mutable module state
     "unavailable": REASON_MEASUREMENT_UNAVAILABLE,
     "error": REASON_MEASUREMENT_ERROR,
     "not_collected": REASON_NOT_COLLECTED,
-}
+})
 
 
 # --------------------------------------------------------------------------
